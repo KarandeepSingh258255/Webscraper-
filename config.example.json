@@ -1,0 +1,22 @@
+{
+  "companies": [
+    "Microsoft",
+    "Amazon Web Services",
+    "Google",
+    "Meta"
+  ],
+  "recipients": [
+    "recipient@example.com"
+  ],
+  "sender": "datacenter-alerts@company.com",
+  "days_back": 7,
+  "max_results_per_company": 5,
+  "draft_only": true,
+  "require_human_approval": true,
+  "email_provider": "graph",
+  "db_path": "agent_state.sqlite3",
+  "draft_dir": "drafts",
+  "schedule_hour": 8,
+  "schedule_minute": 0,
+  "timezone": "America/New_York"
+}
