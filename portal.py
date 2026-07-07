@@ -334,6 +334,8 @@ def create_app() -> Flask:
                 <div class="spacer"></div>
                 {% if report["sent_utc"] %}
                   <span class="status sent">Sent {{ report["sent_utc"] }}</span>
+                {% elif draft_only %}
+                  <span class="status">Draft only</span>
                 {% else %}
                   <form method="post" action="{{ url_for('send_report_route', report_id=report["id"]) }}">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
@@ -348,6 +350,7 @@ def create_app() -> Flask:
             report=report,
             recipients=recipients_list,
             token=token,
+            draft_only=config.draft_only,
         )
         return render("Report", body)
 
@@ -356,6 +359,8 @@ def create_app() -> Flask:
     def send_report_route(report_id: int):
         try:
             check_csrf()
+            if config.draft_only:
+                raise ValueError("Draft-only mode is enabled. Outlook sending is disabled.")
             recipients_sent = send_report(config, report_id)
             flash(f"Sent report {report_id} to {len(recipients_sent)} recipient(s).")
         except Exception as exc:
