@@ -102,7 +102,7 @@ LAYOUT = """
 
 
 def create_app() -> Flask:
-    load_dotenv()
+    load_dotenv(override=True)
     config = load_config(CONFIG_PATH)
     init_db(config.db_path)
     seed_recipients(config)
