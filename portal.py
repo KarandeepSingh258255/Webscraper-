@@ -435,6 +435,6 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    host = os.environ.get("PORTAL_HOST", "127.0.0.1")
-    port = int(os.environ.get("PORTAL_PORT", "8000"))
+    host = os.environ.get("PORTAL_HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT") or os.environ.get("PORTAL_PORT", "8000"))
     app.run(host=host, port=port, debug=False, use_reloader=False)
