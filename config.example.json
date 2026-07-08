@@ -5,15 +5,13 @@
     "Google",
     "Meta"
   ],
-  "recipients": [
-    "recipient@example.com"
-  ],
-  "sender": "datacenter-alerts@company.com",
+  "recipients": [],
+  "sender": "sandbox@example.com",
   "days_back": 7,
   "max_results_per_company": 5,
-  "draft_only": true,
+  "draft_only": false,
   "require_human_approval": true,
-  "email_provider": "mailersend",
+  "email_provider": "smtp",
   "db_path": "agent_state.sqlite3",
   "draft_dir": "drafts",
   "schedule_hour": 8,

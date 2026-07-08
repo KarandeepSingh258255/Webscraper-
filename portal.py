@@ -4,11 +4,15 @@ import hmac
 import json
 import os
 import datetime as dt
+import sqlite3
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from typing import Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 import jwt
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from flask import (
@@ -60,6 +64,7 @@ BASE_CSS = """
   input { padding: 10px 12px; border: 1px solid #b9c2cf; border-radius: 6px; min-width: 260px; }
   select, textarea { padding: 10px 12px; border: 1px solid #b9c2cf; border-radius: 6px; min-width: 260px; }
   textarea { min-height: 120px; width: 100%; }
+  input[type="datetime-local"] { min-width: 220px; }
   button, .button { background: #0b5cab; border: 0; color: white; border-radius: 6px; padding: 10px 14px; text-decoration: none; cursor: pointer; }
   button.secondary, .button.secondary { background: #52616f; }
   .button.active { background: #123a61; }
@@ -154,6 +159,42 @@ def create_app() -> Flask:
         coalesce=True,
     )
     scheduler.start()
+
+    def schedule_report_send_job(report_id: int, scheduled_local: str) -> str:
+        if not scheduled_local:
+            raise ValueError("Choose a send time.")
+
+        local_zone = ZoneInfo(config.timezone)
+        scheduled_local_dt = dt.datetime.fromisoformat(scheduled_local)
+        if scheduled_local_dt.tzinfo is None:
+            scheduled_local_dt = scheduled_local_dt.replace(tzinfo=local_zone)
+        scheduled_utc = scheduled_local_dt.astimezone(dt.UTC)
+        if scheduled_utc <= dt.datetime.now(dt.UTC):
+            raise ValueError("Scheduled send time must be in the future.")
+
+        row = get_report(config.db_path, report_id)
+        if row["sent_utc"]:
+            raise ValueError("This report has already been sent.")
+
+        job_id = f"send-report-{report_id}"
+        scheduler.add_job(
+            lambda rid=report_id: send_report(config, rid),
+            trigger="date",
+            run_date=scheduled_utc,
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=300,
+        )
+        with sqlite3.connect(config.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE reports
+                SET status = 'scheduled', scheduled_send_utc = ?
+                WHERE id = ?
+                """,
+                (scheduled_utc.isoformat(), report_id),
+            )
+        return scheduled_utc.isoformat()
 
     @app.after_request
     def add_security_headers(response):
@@ -330,24 +371,20 @@ def create_app() -> Flask:
     @app.route("/unit-test", methods=["GET", "POST"])
     @login_required
     def unit_test():
-        companies = config.companies
-        if not companies:
-            flash("Add at least one company in config.json before using Unit Test.")
-            return redirect(url_for("index"))
-
-        selected_company = request.form.get("company", companies[0])
+        selected_company = request.form.get("company", "").strip()
         raw_recipients = request.form.get("recipients", "")
 
         if request.method == "POST":
             try:
                 check_csrf()
-                if selected_company not in companies:
-                    raise ValueError("Choose a company from the configured list.")
+                if not selected_company:
+                    raise ValueError("Enter a company name.")
                 recipients = parse_recipient_list(raw_recipients)
                 if not recipients:
                     raise ValueError("Enter at least one recipient email.")
-                report_id = generate_report(
-                    config,
+                unit_test_config = replace(config, max_results_per_company=25)
+                report_id = generate_report_once(
+                    unit_test_config,
                     companies=[selected_company],
                     recipients=recipients,
                     days_back=1,
@@ -372,11 +409,7 @@ def create_app() -> Flask:
                 <div class="row" style="align-items:flex-start;">
                   <div style="flex:1; min-width: 280px;">
                     <label for="company"><strong>Company</strong></label><br>
-                    <select id="company" name="company" required>
-                      {% for company in companies %}
-                        <option value="{{ company }}" {% if company == selected_company %}selected{% endif %}>{{ company }}</option>
-                      {% endfor %}
-                    </select>
+                    <input id="company" name="company" type="text" placeholder="Company name" value="{{ selected_company }}" required>
                   </div>
                   <div style="flex:2; min-width: 320px;">
                     <label for="recipients"><strong>Recipients</strong></label><br>
@@ -391,7 +424,6 @@ def create_app() -> Flask:
             </section>
             """,
             token=csrf_token(),
-            companies=companies,
             selected_company=selected_company,
             raw_recipients=raw_recipients,
         )
@@ -401,12 +433,15 @@ def create_app() -> Flask:
     @login_required
     def report_detail(report_id: int):
         report = get_report(config.db_path, report_id)
+        summary = json.loads(report["summary_json"])
+        diagnostics = summary.get("diagnostics") if isinstance(summary, dict) else None
         recipients_list = (
             json.loads(report["target_recipients_json"])
             if report["target_recipients_json"]
             else get_recipients(config.db_path)
         )
         token = csrf_token()
+        scheduled_send_utc = report["scheduled_send_utc"]
         body = render_template_string(
             """
             <section class="panel">
@@ -418,23 +453,53 @@ def create_app() -> Flask:
                 <div class="spacer"></div>
                 {% if report["sent_utc"] %}
                   <span class="status sent">Sent {{ report["sent_utc"] }}</span>
-                {% elif draft_only %}
-                  <span class="status">Draft only</span>
                 {% else %}
-                  <form method="post" action="{{ url_for('send_report_route', report_id=report["id"]) }}">
-                    <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <button type="submit">Send with MailerSend</button>
-                  </form>
+                  <div class="row" style="justify-content:flex-end;">
+                    <form method="post" action="{{ url_for('send_report_route', report_id=report["id"]) }}">
+                      <input type="hidden" name="csrf_token" value="{{ token }}">
+                      <button type="submit">Send now</button>
+                    </form>
+                    <form method="post" action="{{ url_for('schedule_report_route', report_id=report["id"]) }}" class="row">
+                      <input type="hidden" name="csrf_token" value="{{ token }}">
+                      <input type="datetime-local" name="scheduled_send_local" required>
+                      <button class="secondary" type="submit">Schedule send</button>
+                    </form>
+                  </div>
                 {% endif %}
               </div>
               <p><strong>Recipients:</strong> {{ recipients|join(", ") if recipients else "None added" }}</p>
+              {% if scheduled_send_utc and not report["sent_utc"] %}
+                <p class="muted"><strong>Scheduled:</strong> {{ scheduled_send_utc }}</p>
+              {% endif %}
             </section>
+            {% if diagnostics %}
+            <section class="panel">
+              <h2 style="margin-top:0;">Diagnostics</h2>
+              <table>
+                <tbody>
+                  <tr><th style="text-align:left;">Requested window</th><td>{{ diagnostics["requested_days_back"] }} day(s)</td></tr>
+                  <tr><th style="text-align:left;">Raw Tavily results</th><td>{{ diagnostics["raw_results_count"] }}</td></tr>
+                  <tr><th style="text-align:left;">Qualified results in requested window</th><td>{{ diagnostics["qualified_results_count"] }}</td></tr>
+                  <tr><th style="text-align:left;">Recent undated pages included</th><td>{{ diagnostics["recent_undated_included_count"] }}</td></tr>
+                  <tr><th style="text-align:left;">Structured summary fallback used</th><td>{{ "Yes" if diagnostics["fallback_summary_used"] else "No" }}</td></tr>
+                  <tr><th style="text-align:left;">Fallback used</th><td>{{ "Yes" if diagnostics["fallback_used"] else "No" }}</td></tr>
+                  {% if diagnostics["fallback_used"] %}
+                    <tr><th style="text-align:left;">Fallback window</th><td>{{ diagnostics["fallback_days_back"] }} day(s)</td></tr>
+                    <tr><th style="text-align:left;">Fallback raw results</th><td>{{ diagnostics["fallback_raw_results_count"] }}</td></tr>
+                    <tr><th style="text-align:left;">Fallback qualified results</th><td>{{ diagnostics["fallback_qualified_results_count"] }}</td></tr>
+                    <tr><th style="text-align:left;">Fallback recent undated pages included</th><td>{{ diagnostics["fallback_recent_undated_included_count"] }}</td></tr>
+                  {% endif %}
+                </tbody>
+              </table>
+            </section>
+            {% endif %}
             <iframe srcdoc="{{ report["email_html"]|e }}"></iframe>
             """,
             report=report,
+            diagnostics=diagnostics,
             recipients=recipients_list,
             token=token,
-            draft_only=config.draft_only,
+            scheduled_send_utc=scheduled_send_utc,
         )
         return render("Report", body)
 
@@ -443,16 +508,30 @@ def create_app() -> Flask:
     def send_report_route(report_id: int):
         try:
             check_csrf()
-            if config.draft_only:
-                raise ValueError("Draft-only mode is enabled. MailerSend sending is disabled.")
             report = get_report(config.db_path, report_id)
             recipients_override = (
                 json.loads(report["target_recipients_json"])
                 if report["target_recipients_json"]
                 else None
             )
+            try:
+                scheduler.remove_job(f"send-report-{report_id}")
+            except JobLookupError:
+                pass
             recipients_sent = send_report(config, report_id, recipients=recipients_override)
             flash(f"Sent report {report_id} to {len(recipients_sent)} recipient(s).")
+        except Exception as exc:
+            flash(str(exc))
+        return redirect(url_for("report_detail", report_id=report_id))
+
+    @app.route("/reports/<int:report_id>/schedule-send", methods=["POST"])
+    @login_required
+    def schedule_report_route(report_id: int):
+        try:
+            check_csrf()
+            scheduled_send_local = request.form.get("scheduled_send_local", "")
+            scheduled_utc = schedule_report_send_job(report_id, scheduled_send_local)
+            flash(f"Scheduled report {report_id} for {scheduled_utc}.")
         except Exception as exc:
             flash(str(exc))
         return redirect(url_for("report_detail", report_id=report_id))

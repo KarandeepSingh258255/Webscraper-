@@ -8,10 +8,10 @@ Pipeline:
 2. Optionally clean source pages with Firecrawl
 3. Use Gemini to keep only data-center-relevant findings
 4. Store the finished report in a login-protected portal
-5. Let a user review the report, manage recipients, and click one button to send through MailerSend
-6. Use the Unit Test tab to pick one company, generate a 24-hour report, and aim it at chosen recipients
+5. Let a user review the report, manage recipients, and send or schedule delivery through SMTP
+6. Use the Unit Test tab to type one company, generate a 24-hour report, and aim it at chosen recipients
 
-The app does not read company inboxes. It only sends through MailerSend from the approved sending domain.
+The app does not read company inboxes. It sends through SMTP. For development, Mailtrap Sandbox is the simplest target.
 
 ## Setup
 
@@ -23,7 +23,7 @@ Copy-Item .env.example .env
 Copy-Item config.example.json config.json
 ```
 
-Edit `.env` with API keys and portal credentials. Edit `config.json` with your companies, initial recipients, sender, and timezone.
+Edit `.env` with API keys, SMTP credentials, and portal credentials. Edit `config.json` with your companies, sender, and timezone.
 
 ## Required Environment
 
@@ -34,9 +34,12 @@ PORTAL_PASSWORD_HASH=...
 PORTAL_SECRET_KEY=...
 PORTAL_JWT_SECRET=...
 PORTAL_JWT_EXP_MINUTES=480
-MAILERSEND_API_KEY=...
+SMTP_USERNAME=...
+SMTP_PASSWORD=...
+SMTP_HOST=sandbox.smtp.mailtrap.io
+SMTP_PORT=2525
 GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.0-flash
+GEMINI_MODEL=gemini-2.5-flash
 ```
 
 Firecrawl is optional but recommended:
@@ -83,10 +86,10 @@ The portal:
 
 - generates a report every day at `schedule_hour` / `schedule_minute` in `config.json`
 - has a `Run now` button for manual report generation
-- has a `Unit Test` tab for one-company, last-24-hours reports
+- has a `Unit Test` tab for typed one-company, last-24-hours reports
 - stores reports in `agent_state.sqlite3`
 - lets you add or remove recipient emails
-- sends the reviewed report through MailerSend with one button
+- lets you send the reviewed report immediately or schedule it through SMTP
 
 For production, run the portal behind company SSO or a private VPN/reverse proxy with HTTPS. Set this when HTTPS is enabled:
 
@@ -106,15 +109,15 @@ python scripts/scan_secrets.py
 
 If a real key was committed, rotate that key in the provider dashboard. Removing it from the latest file is not enough once it has existed in git history.
 
-## MailerSend Setup
+## Mailtrap Sandbox Setup
 
-Use an approved sender such as:
+Create a Mailtrap account, create a sandbox inbox, and copy that inbox's SMTP credentials into `.env`. Use the sender you want to appear in `config.json`, for example:
 
 ```text
-datacenter-alerts@company.com
+alerts@example.com
 ```
 
-Create a MailerSend API token in Settings -> API Tokens and verify the sending domain for the `sender` address in `config.json`. Keep the token limited to the account and domain your team approves.
+Mailtrap Sandbox captures messages for testing instead of delivering them to real inboxes. Use the SMTP host, port, username, and password shown by Mailtrap for your sandbox inbox. If you later move to Gmail or Outlook SMTP, keep the same `SMTP_*` variables and change only the values.
 
 ## Manual CLI Generation
 
@@ -125,3 +128,9 @@ python Main.py
 ```
 
 That stores a draft report in the same portal database.
+
+To see which Gemini model ids your current API key can actually use for `generateContent`, run:
+
+```powershell
+python scripts/list_gemini_models.py
+```
