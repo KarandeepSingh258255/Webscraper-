@@ -1,19 +1,35 @@
-# Data Center Intelligence Portal
+# Data Center Report App
 
-This is a public-web-only MVP for a daily data center intelligence workflow.
+This app looks for news about data centers.
 
-Pipeline:
+Then it turns that news into an email report.
 
-1. At 8:00 AM, search selected companies with Tavily
-2. Optionally clean source pages with Firecrawl
-3. Use Gemini to keep only data-center-relevant findings
-4. Store the finished report in a login-protected portal
-5. Let a user review the report, manage recipients, and send or schedule delivery through SMTP
-6. Use the Unit Test tab to type one company, generate a 24-hour report, and aim it at chosen recipients
+Then you can review the report and send it.
 
-The app does not read company inboxes. It sends through SMTP. For development, Mailtrap Sandbox is the simplest target.
+## What This App Does
 
-## Setup
+You type in a company name.
+
+The app:
+
+1. looks for public web articles
+2. keeps the ones about data centers and related topics
+3. writes a report
+4. shows the report in a small web portal
+5. lets you send the report or schedule it
+
+## What You Need
+
+You need:
+
+- Python
+- a Tavily API key
+- a Gemini API key
+- a Mailtrap sandbox inbox for test email sending
+
+## First-Time Setup
+
+Open PowerShell in this folder and run:
 
 ```powershell
 python -m venv .venv
@@ -23,114 +39,237 @@ Copy-Item .env.example .env
 Copy-Item config.example.json config.json
 ```
 
-Edit `.env` with API keys, SMTP credentials, and portal credentials. Edit `config.json` with your companies, sender, and timezone.
+## Step 1: Fill In `.env`
 
-## Required Environment
+Open [`.env`](C:\Users\karan\Webscraper-\.env)
+
+Add your real values:
 
 ```text
-TAVILY_API_KEY=...
-PORTAL_USERNAME=...
-PORTAL_PASSWORD_HASH=...
-PORTAL_SECRET_KEY=...
-PORTAL_JWT_SECRET=...
-PORTAL_JWT_EXP_MINUTES=480
-SMTP_USERNAME=...
-SMTP_PASSWORD=...
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-2.5-flash
+
+TAVILY_API_KEY=your_tavily_key
+FIRECRAWL_API_KEY=your_firecrawl_key
+
+SMTP_USERNAME=your_mailtrap_username
+SMTP_PASSWORD=your_mailtrap_password
 SMTP_HOST=sandbox.smtp.mailtrap.io
 SMTP_PORT=2525
-GEMINI_API_KEY=...
-GEMINI_MODEL=gemini-2.5-flash
+
+PORTAL_USERNAME=your_username
+PORTAL_PASSWORD_HASH=put_a_hash_here
+PORTAL_SECRET_KEY=put_a_secret_here
+PORTAL_JWT_SECRET=put_another_secret_here
+PORTAL_JWT_EXP_MINUTES=480
 ```
 
-Firecrawl is optional but recommended:
+Notes:
 
-```text
-FIRECRAWL_API_KEY=...
-```
+- `FIRECRAWL_API_KEY` is optional
+- `SMTP_*` should come from your Mailtrap sandbox inbox
 
-Generate a password hash instead of storing a plaintext portal password:
+## Step 2: Make The Login Password
+
+Run this:
 
 ```powershell
 python -c "from werkzeug.security import generate_password_hash; import getpass; print(generate_password_hash(getpass.getpass('Portal password: ')))"
 ```
 
-Generate a session secret:
+Paste the result into `.env` for:
+
+```text
+PORTAL_PASSWORD_HASH=
+```
+
+## Step 3: Make The Secret Keys
+
+Run this:
 
 ```powershell
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-Put those generated values into `.env` as `PORTAL_PASSWORD_HASH` and `PORTAL_SECRET_KEY`.
+Run it 2 times.
 
-Generate a separate JWT signing secret by running the same command again:
+Put one result here:
 
-```powershell
-python -c "import secrets; print(secrets.token_hex(32))"
+```text
+PORTAL_SECRET_KEY=
 ```
 
-Put that value into `.env` as `PORTAL_JWT_SECRET`. `PORTAL_JWT_EXP_MINUTES` controls how long the login cookie remains valid.
+Put the other result here:
 
-## Run The Secure Portal
+```text
+PORTAL_JWT_SECRET=
+```
+
+## Step 4: Fill In `config.json`
+
+Open [`config.json`](C:\Users\karan\Webscraper-\config.json)
+
+You will see something like this:
+
+```json
+{
+  "companies": [
+    "Microsoft",
+    "Amazon Web Services",
+    "Google",
+    "Meta"
+  ],
+  "recipients": [],
+  "sender": "sandbox@example.com",
+  "days_back": 7,
+  "max_results_per_company": 5,
+  "draft_only": false,
+  "require_human_approval": true,
+  "email_provider": "smtp",
+  "db_path": "agent_state.sqlite3",
+  "draft_dir": "drafts",
+  "schedule_hour": 8,
+  "schedule_minute": 0,
+  "timezone": "America/New_York",
+  "sender_name": "Data Center Intelligence"
+}
+```
+
+Change the parts you want:
+
+- `companies`: the companies you care about
+- `sender`: the sender name/address you want to show in testing
+- `schedule_hour`: what hour the daily run should happen
+- `schedule_minute`: what minute the daily run should happen
+
+Keep this as:
+
+```json
+"email_provider": "smtp"
+```
+
+## Step 5: Start The App
+
+Run:
 
 ```powershell
 python portal.py
 ```
 
-Open:
+Then open:
 
 ```text
 http://127.0.0.1:8000
 ```
 
-The portal:
+## How To Use It
 
-- generates a report every day at `schedule_hour` / `schedule_minute` in `config.json`
-- has a `Run now` button for manual report generation
-- has a `Unit Test` tab for typed one-company, last-24-hours reports
-- stores reports in `agent_state.sqlite3`
-- lets you add or remove recipient emails
-- lets you send the reviewed report immediately or schedule it through SMTP
+### Daily report
 
-For production, run the portal behind company SSO or a private VPN/reverse proxy with HTTPS. Set this when HTTPS is enabled:
+The app can make reports on a schedule.
 
-```text
-PORTAL_COOKIE_SECURE=true
-```
+It uses the companies listed in `config.json`.
 
-## Secret Protection
+### Run now
 
-Real credentials belong in `.env`, not `.env.example`, `README.md`, or source files. The repo ignores `.env`, local config, service-account JSON files, private keys, generated drafts, and the SQLite state database.
+Press `Run now` if you want a report right away.
 
-Run this before committing:
+### Unit Test
+
+Open the `Unit Test` tab if you want to test one company.
+
+You:
+
+1. type the company name
+2. type recipient emails
+3. press the button
+
+The app:
+
+1. looks for news from the last 24 hours
+2. if nothing qualifies, it can fall back to 3 days
+3. writes the report
+4. shows diagnostics so you can see what happened
+
+### Review report
+
+After a report is made, you can:
+
+- read it
+- send it now
+- schedule it for later
+
+## What The Diagnostics Mean
+
+On the report page you may see a `Diagnostics` box.
+
+This helps explain why a report looks the way it does.
+
+- `Raw Tavily results`: how many search hits came back
+- `Qualified results in requested window`: how many passed the date filter
+- `Recent undated pages included`: how many had no clean date but looked recent enough
+- `Fallback used`: whether the app widened the time window
+- `Structured summary fallback used`: whether Gemini failed and the app built a simpler backup summary
+
+## Where Test Emails Go
+
+Right now this app is set up for **Mailtrap sandbox**.
+
+That means test emails do **not** go to real inboxes.
+
+They go to your Mailtrap inbox so you can inspect them safely.
+
+## Helpful Commands
+
+Start the portal:
 
 ```powershell
-python scripts/scan_secrets.py
+python portal.py
 ```
 
-If a real key was committed, rotate that key in the provider dashboard. Removing it from the latest file is not enough once it has existed in git history.
-
-## Mailtrap Sandbox Setup
-
-Create a Mailtrap account, create a sandbox inbox, and copy that inbox's SMTP credentials into `.env`. Use the sender you want to appear in `config.json`, for example:
-
-```text
-alerts@example.com
-```
-
-Mailtrap Sandbox captures messages for testing instead of delivering them to real inboxes. Use the SMTP host, port, username, and password shown by Mailtrap for your sandbox inbox. If you later move to Gmail or Outlook SMTP, keep the same `SMTP_*` variables and change only the values.
-
-## Manual CLI Generation
-
-You can still generate a report without the portal:
+Generate a report from the command line:
 
 ```powershell
 python Main.py
 ```
 
-That stores a draft report in the same portal database.
-
-To see which Gemini model ids your current API key can actually use for `generateContent`, run:
+See which Gemini models your key can use:
 
 ```powershell
 python scripts/list_gemini_models.py
 ```
+
+Scan for secrets before committing:
+
+```powershell
+python scripts/scan_secrets.py
+```
+
+## Important Safety Note
+
+Do not put real secrets in:
+
+- `README.md`
+- `.env.example`
+- source code
+
+Put real secrets only in:
+
+- [`.env`](C:\Users\karan\Webscraper-\.env)
+
+## If Something Breaks
+
+If the report says no updates were found:
+
+- the search may not have found enough recent pages
+- the pages may not have usable dates
+- the company may simply not have new public data center news right now
+
+If the report uses a fallback summary:
+
+- Gemini did not return clean JSON
+- the app still made a backup structured report instead of failing
+
+## In One Sentence
+
+This app searches for data center news, turns it into an email report, and lets you test and send that report from a web page.
