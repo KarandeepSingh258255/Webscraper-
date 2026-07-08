@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import datetime as dt
 from functools import wraps
@@ -26,12 +27,14 @@ from werkzeug.security import check_password_hash
 
 from Main import (
     add_recipient,
+    generate_report,
     generate_report_once,
     get_recipients,
     get_report,
     get_reports,
     init_db,
     load_config,
+    parse_recipient_list,
     remove_recipient,
     seed_recipients,
     send_report,
@@ -55,8 +58,11 @@ BASE_CSS = """
   .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
   .spacer { flex: 1; }
   input { padding: 10px 12px; border: 1px solid #b9c2cf; border-radius: 6px; min-width: 260px; }
+  select, textarea { padding: 10px 12px; border: 1px solid #b9c2cf; border-radius: 6px; min-width: 260px; }
+  textarea { min-height: 120px; width: 100%; }
   button, .button { background: #0b5cab; border: 0; color: white; border-radius: 6px; padding: 10px 14px; text-decoration: none; cursor: pointer; }
   button.secondary, .button.secondary { background: #52616f; }
+  .button.active { background: #123a61; }
   button.danger { background: #a42b2b; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; border-bottom: 1px solid #e3e7ee; padding: 10px 8px; vertical-align: top; }
@@ -84,8 +90,9 @@ LAYOUT = """
     <div><strong>Data Center Intelligence Portal</strong></div>
     {% if is_authenticated %}
       <nav class="row">
-        <a class="button secondary" href="{{ url_for('index') }}">Reports</a>
-        <a class="button secondary" href="{{ url_for('recipients') }}">Recipients</a>
+        <a class="button {% if current_page == 'reports' %}active{% else %}secondary{% endif %}" href="{{ url_for('index') }}">Reports</a>
+        <a class="button {% if current_page == 'unit_test' %}active{% else %}secondary{% endif %}" href="{{ url_for('unit_test') }}">Unit Test</a>
+        <a class="button {% if current_page == 'recipients' %}active{% else %}secondary{% endif %}" href="{{ url_for('recipients') }}">Recipients</a>
         <a class="button secondary" href="{{ url_for('logout') }}">Logout</a>
       </nav>
     {% endif %}
@@ -161,6 +168,7 @@ def create_app() -> Flask:
             title=title,
             body=body,
             is_authenticated=bool(getattr(g, "current_user", None)),
+            current_page=context.pop("current_page", ""),
             **context,
         )
 
@@ -212,8 +220,10 @@ def create_app() -> Flask:
             raise ValueError("Invalid form token.")
 
     def csrf_token() -> str:
-        token = os.urandom(24).hex()
-        session["csrf_token"] = token
+        token = session.get("csrf_token")
+        if not token:
+            token = os.urandom(24).hex()
+            session["csrf_token"] = token
         return token
 
     @app.route("/login", methods=["GET", "POST"])
@@ -304,7 +314,7 @@ def create_app() -> Flask:
             minute=f"{config.schedule_minute:02d}",
             timezone=config.timezone,
         )
-        return render("Reports", body)
+        return render("Reports", body, current_page="reports")
 
     @app.route("/run-now", methods=["POST"])
     @login_required
@@ -317,11 +327,85 @@ def create_app() -> Flask:
             flash(str(exc))
         return redirect(url_for("index"))
 
+    @app.route("/unit-test", methods=["GET", "POST"])
+    @login_required
+    def unit_test():
+        companies = config.companies
+        if not companies:
+            flash("Add at least one company in config.json before using Unit Test.")
+            return redirect(url_for("index"))
+
+        selected_company = request.form.get("company", companies[0])
+        raw_recipients = request.form.get("recipients", "")
+
+        if request.method == "POST":
+            try:
+                check_csrf()
+                if selected_company not in companies:
+                    raise ValueError("Choose a company from the configured list.")
+                recipients = parse_recipient_list(raw_recipients)
+                if not recipients:
+                    raise ValueError("Enter at least one recipient email.")
+                report_id = generate_report(
+                    config,
+                    companies=[selected_company],
+                    recipients=recipients,
+                    days_back=1,
+                    time_window_label="the last 24 hours",
+                )
+                flash(f"Generated unit test report {report_id} for {selected_company}.")
+                return redirect(url_for("report_detail", report_id=report_id))
+            except Exception as exc:
+                flash(str(exc))
+
+        body = render_template_string(
+            """
+            <section class="panel">
+              <div class="row">
+                <div>
+                  <h1>Unit Test</h1>
+                  <p class="muted">Generate a one-company report from the last 24 hours and send it to the addresses you choose.</p>
+                </div>
+              </div>
+              <form method="post">
+                <input type="hidden" name="csrf_token" value="{{ token }}">
+                <div class="row" style="align-items:flex-start;">
+                  <div style="flex:1; min-width: 280px;">
+                    <label for="company"><strong>Company</strong></label><br>
+                    <select id="company" name="company" required>
+                      {% for company in companies %}
+                        <option value="{{ company }}" {% if company == selected_company %}selected{% endif %}>{{ company }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div style="flex:2; min-width: 320px;">
+                    <label for="recipients"><strong>Recipients</strong></label><br>
+                    <textarea id="recipients" name="recipients" placeholder="name@company.com, other@company.com" required>{{ raw_recipients }}</textarea>
+                    <div class="muted">Separate emails with commas, semicolons, or new lines.</div>
+                  </div>
+                </div>
+                <div style="margin-top: 16px;">
+                  <button type="submit">Generate 24 Hour Report</button>
+                </div>
+              </form>
+            </section>
+            """,
+            token=csrf_token(),
+            companies=companies,
+            selected_company=selected_company,
+            raw_recipients=raw_recipients,
+        )
+        return render("Unit Test", body, current_page="unit_test")
+
     @app.route("/reports/<int:report_id>")
     @login_required
     def report_detail(report_id: int):
         report = get_report(config.db_path, report_id)
-        recipients_list = get_recipients(config.db_path)
+        recipients_list = (
+            json.loads(report["target_recipients_json"])
+            if report["target_recipients_json"]
+            else get_recipients(config.db_path)
+        )
         token = csrf_token()
         body = render_template_string(
             """
@@ -339,7 +423,7 @@ def create_app() -> Flask:
                 {% else %}
                   <form method="post" action="{{ url_for('send_report_route', report_id=report["id"]) }}">
                     <input type="hidden" name="csrf_token" value="{{ token }}">
-                    <button type="submit">Send with Outlook</button>
+                    <button type="submit">Send with MailerSend</button>
                   </form>
                 {% endif %}
               </div>
@@ -360,8 +444,14 @@ def create_app() -> Flask:
         try:
             check_csrf()
             if config.draft_only:
-                raise ValueError("Draft-only mode is enabled. Outlook sending is disabled.")
-            recipients_sent = send_report(config, report_id)
+                raise ValueError("Draft-only mode is enabled. MailerSend sending is disabled.")
+            report = get_report(config.db_path, report_id)
+            recipients_override = (
+                json.loads(report["target_recipients_json"])
+                if report["target_recipients_json"]
+                else None
+            )
+            recipients_sent = send_report(config, report_id, recipients=recipients_override)
             flash(f"Sent report {report_id} to {len(recipients_sent)} recipient(s).")
         except Exception as exc:
             flash(str(exc))
@@ -415,7 +505,7 @@ def create_app() -> Flask:
             recipients=recipient_rows,
             token=token,
         )
-        return render("Recipients", body)
+        return render("Recipients", body, current_page="recipients")
 
     @app.route("/recipients/<path:email>/delete", methods=["POST"])
     @login_required

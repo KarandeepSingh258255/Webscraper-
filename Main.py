@@ -4,17 +4,17 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
 
 
 ROOT = Path(__file__).resolve().parent
@@ -109,6 +109,7 @@ class Config:
     companies: list[str]
     recipients: list[str]
     sender: str
+    sender_name: str
     days_back: int
     max_results_per_company: int
     draft_only: bool
@@ -132,10 +133,11 @@ def load_config(path: Path) -> Config:
         companies=raw.get("companies", []),
         recipients=raw.get("recipients", []),
         sender=raw.get("sender", "datacenter-alerts@company.com"),
+        sender_name=raw.get("sender_name", "Data Center Intelligence"),
         days_back=int(raw.get("days_back", 7)),
         max_results_per_company=int(raw.get("max_results_per_company", 5)),
         draft_only=bool(raw.get("draft_only", True)),
-        email_provider=raw.get("email_provider", "draft").lower(),
+        email_provider=raw.get("email_provider", "mailersend").lower(),
         require_human_approval=bool(raw.get("require_human_approval", True)),
         db_path=Path(os.environ.get("PORTAL_DB_PATH", raw.get("db_path", DEFAULT_DB_PATH))),
         draft_dir=Path(os.environ.get("PORTAL_DRAFT_DIR", raw.get("draft_dir", DEFAULT_DRAFT_DIR))),
@@ -191,6 +193,7 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+        _ensure_column(conn, "reports", "target_recipients_json", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS recipients (
@@ -199,6 +202,12 @@ def init_db(db_path: Path) -> None:
             )
             """
         )
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
 
 
 def seed_recipients(config: Config) -> None:
@@ -233,11 +242,25 @@ def remove_recipient(db_path: Path, email: str) -> None:
         conn.execute("DELETE FROM recipients WHERE email = ?", (email.lower().strip(),))
 
 
-def tavily_search(company: str, config: Config) -> list[dict[str, Any]]:
+def parse_recipient_list(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+
+    recipients = [piece.strip().lower() for piece in re.split(r"[\s,;]+", raw) if piece.strip()]
+    validated: list[str] = []
+    for email in recipients:
+        if "@" not in email or "." not in email:
+            raise ValueError(f"Enter a valid email address: {email}")
+        validated.append(email)
+    return list(dict.fromkeys(validated))
+
+
+def tavily_search(company: str, config: Config, days_back: int | None = None) -> list[dict[str, Any]]:
     api_key = os.environ.get("TAVILY_API_KEY")
     if not api_key:
         raise RuntimeError("TAVILY_API_KEY is required for web search.")
 
+    search_days = config.days_back if days_back is None else days_back
     query = (
         f'"{company}" data center OR datacenter OR "AI infrastructure" OR colocation '
         f'OR "power" OR utility OR campus recent'
@@ -251,7 +274,7 @@ def tavily_search(company: str, config: Config) -> list[dict[str, Any]]:
             "include_answer": False,
             "include_raw_content": False,
             "max_results": config.max_results_per_company,
-            "days": config.days_back,
+            "days": search_days,
         },
         timeout=30,
     )
@@ -275,13 +298,18 @@ def firecrawl_scrape(url: str) -> str:
     return data.get("markdown") or data.get("content") or ""
 
 
-def collect_sources(config: Config) -> list[dict[str, Any]]:
+def collect_sources(
+    config: Config,
+    companies: list[str] | None = None,
+    days_back: int | None = None,
+) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     now = dt.datetime.now(dt.UTC).isoformat()
+    target_companies = companies or config.companies
 
     with sqlite3.connect(config.db_path) as conn:
-        for company in config.companies:
-            for result in tavily_search(company, config):
+        for company in target_companies:
+            for result in tavily_search(company, config, days_back=days_back):
                 url = result.get("url", "")
                 if not url:
                     continue
@@ -322,7 +350,12 @@ def collect_sources(config: Config) -> list[dict[str, Any]]:
     return sources
 
 
-def build_summary(config: Config, sources: list[dict[str, Any]]) -> dict[str, Any]:
+def build_summary(
+    config: Config,
+    sources: list[dict[str, Any]],
+    companies: list[str] | None = None,
+    time_window_label: str | None = None,
+) -> dict[str, Any]:
     if not sources:
         return {
             "email_subject": "Data center intelligence: no public updates found",
@@ -332,106 +365,187 @@ def build_summary(config: Config, sources: list[dict[str, Any]]) -> dict[str, An
             "approval_notes": "No sources were available to summarize.",
         }
 
-    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-    model = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+    company_list = companies or config.companies
+    window_text = time_window_label or f"the last {config.days_back} day(s)"
+    prompt_context = build_summary_prompt_context(
+        company_list=company_list,
+        window_text=window_text,
+        sources=sources,
+    )
+    return build_summary_with_gemini(prompt_context)
+
+
+def build_summary_prompt_context(
+    company_list: list[str],
+    window_text: str,
+    sources: list[dict[str, Any]],
+) -> dict[str, str]:
     today = dt.date.today().isoformat()
     source_payload = json.dumps(sources, ensure_ascii=False)
+    return {
+        "today": today,
+        "company_list": ", ".join(company_list),
+        "window_text": window_text,
+        "source_payload": source_payload,
+    }
 
-    completion = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        response_format={"type": "json_schema", "json_schema": SUMMARY_SCHEMA},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You write concise data center intelligence emails from public web sources only. "
-                    "Do not infer private company information. Include a source URL for every major claim. "
-                    "Exclude items that are not related to data centers, AI infrastructure, power, sites, "
-                    "leadership, earnings, partnerships, or material business risks."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Today is {today}. Build a morning intelligence email for these companies: "
-                    f"{', '.join(config.companies)}.\n\n"
-                    f"Focus areas: {', '.join(DATA_CENTER_TOPICS)}.\n\n"
-                    "Use only the source payload below. If a claim lacks a URL, omit it. "
-                    "Keep the email scannable for sales and market intelligence readers. "
-                    "Mention when no relevant public update was found for a company.\n\n"
-                    f"SOURCES_JSON:\n{source_payload}"
-                ),
-            },
-        ],
+
+def build_summary_prompt(context: dict[str, str]) -> tuple[str, str]:
+    system_prompt = (
+        "You write concise data center intelligence emails from public web sources only. "
+        "Do not infer private company information. Include a source URL for every major claim. "
+        "Exclude items that are not related to data centers, AI infrastructure, power, sites, "
+        "leadership, earnings, partnerships, or material business risks."
     )
+    user_prompt = (
+        f"Today is {context['today']}. Build a concise intelligence email for these companies: "
+        f"{context['company_list']}.\n"
+        f"Focus on public information from {context['window_text']}.\n\n"
+        f"Focus areas: {', '.join(DATA_CENTER_TOPICS)}.\n\n"
+        "Use only the source payload below. If a claim lacks a URL, omit it. "
+        "Keep the email scannable for sales and market intelligence readers. "
+        "Mention when no relevant public update was found for a company.\n\n"
+        f"SOURCES_JSON:\n{context['source_payload']}"
+    )
+    return system_prompt, user_prompt
 
-    content = completion.choices[0].message.content
-    if not content:
-        raise RuntimeError("OpenAI returned an empty summary.")
-    return json.loads(content)
+
+def build_summary_with_gemini(context: dict[str, str]) -> dict[str, Any]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    system_prompt, user_prompt = build_summary_prompt(context)
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": api_key},
+        headers={
+            "content-type": "application/json",
+        },
+        json={
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 2500,
+                "responseMimeType": "application/json",
+            },
+        },
+        timeout=60,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Gemini request failed with {response.status_code}: {response.text}"
+        )
+    data = response.json()
+    text = extract_gemini_output_text(data).strip()
+    if not text:
+        raise RuntimeError("Gemini returned an empty summary.")
+
+    summary = validate_summary_payload(json.loads(extract_json_text(text)))
+    return summary
 
 
-def write_draft(config: Config, summary: dict[str, Any]) -> Path:
+def extract_json_text(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+
+    if not stripped.startswith("{"):
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            stripped = stripped[start : end + 1]
+    return stripped
+
+
+def extract_gemini_output_text(payload: dict[str, Any]) -> str:
+    candidates: list[str] = []
+
+    for candidate in payload.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content", {})
+        if isinstance(content, dict):
+            for part in content.get("parts", []):
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    candidates.append(part["text"])
+
+    if candidates:
+        return "".join(candidates)
+
+    return str(payload.get("text", "") or payload.get("output_text", ""))
+
+
+def validate_summary_payload(summary: dict[str, Any]) -> dict[str, Any]:
+    required = ["email_subject", "email_text", "email_html", "companies", "approval_notes"]
+    missing = [key for key in required if key not in summary]
+    if missing:
+        raise RuntimeError(f"Model returned an invalid summary missing: {', '.join(missing)}")
+    return summary
+
+
+def write_draft(
+    config: Config,
+    summary: dict[str, Any],
+    recipients: list[str] | None = None,
+) -> Path:
     config.draft_dir.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = config.draft_dir / f"data-center-intel-{stamp}.eml"
 
-    path.write_text(build_email_message(config, summary).as_string(), encoding="utf-8")
+    path.write_text(
+        build_email_message(config, summary, recipients=recipients).as_string(),
+        encoding="utf-8",
+    )
     return path
 
 
-def build_email_message(config: Config, summary: dict[str, Any]) -> EmailMessage:
+def build_email_message(
+    config: Config,
+    summary: dict[str, Any],
+    recipients: list[str] | None = None,
+) -> EmailMessage:
     msg = EmailMessage()
-    msg["From"] = config.sender
-    msg["To"] = ", ".join(config.recipients)
+    msg["From"] = f"{config.sender_name} <{config.sender}>"
+    msg["To"] = ", ".join(recipients or config.recipients)
     msg["Subject"] = summary["email_subject"]
     msg.set_content(summary["email_text"])
     msg.add_alternative(summary["email_html"], subtype="html")
     return msg
 
 
-def send_with_graph(
+def send_with_mailersend(
     config: Config, summary: dict[str, Any], recipients: list[str] | None = None
 ) -> None:
-    tenant_id = os.environ["MS_GRAPH_TENANT_ID"]
-    client_id = os.environ["MS_GRAPH_CLIENT_ID"]
-    client_secret = os.environ["MS_GRAPH_CLIENT_SECRET"]
+    api_key = os.environ["MAILERSEND_API_KEY"]
     recipients = recipients or config.recipients
 
-    token_response = requests.post(
-        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
-        data={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "scope": "https://graph.microsoft.com/.default",
-            "grant_type": "client_credentials",
-        },
-        timeout=30,
-    )
-    token_response.raise_for_status()
-    access_token = token_response.json()["access_token"]
-
     payload = {
-        "message": {
-            "subject": summary["email_subject"],
-            "body": {"contentType": "HTML", "content": summary["email_html"]},
-            "toRecipients": [
-                {"emailAddress": {"address": recipient}} for recipient in recipients
-            ],
-        },
-        "saveToSentItems": True,
+        "from": {"email": config.sender, "name": config.sender_name},
+        "to": [{"email": recipient} for recipient in recipients],
+        "subject": summary["email_subject"],
+        "text": summary["email_text"],
+        "html": summary["email_html"],
     }
     send_response = requests.post(
-        f"https://graph.microsoft.com/v1.0/users/{config.sender}/sendMail",
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        "https://api.mailersend.com/v1/email",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json=payload,
         timeout=30,
     )
     send_response.raise_for_status()
 
 
-def record_report(config: Config, summary: dict[str, Any], draft_path: Path, mode: str) -> None:
+def record_report(
+    config: Config,
+    summary: dict[str, Any],
+    draft_path: Path,
+    mode: str,
+    recipients: list[str],
+) -> None:
     with sqlite3.connect(config.db_path) as conn:
         conn.execute(
             """
@@ -440,7 +554,7 @@ def record_report(config: Config, summary: dict[str, Any], draft_path: Path, mod
             """,
             (
                 summary["email_subject"],
-                json.dumps(config.recipients),
+                json.dumps(recipients),
                 str(draft_path),
                 dt.datetime.now(dt.UTC).isoformat() if mode == "sent" else None,
                 mode,
@@ -449,14 +563,18 @@ def record_report(config: Config, summary: dict[str, Any], draft_path: Path, mod
 
 
 def store_report(
-    config: Config, summary: dict[str, Any], draft_path: Path, source_count: int
+    config: Config,
+    summary: dict[str, Any],
+    draft_path: Path,
+    source_count: int,
+    recipients: list[str],
 ) -> int:
     with sqlite3.connect(config.db_path) as conn:
         cursor = conn.execute(
             """
             INSERT INTO reports
-            (subject, email_text, email_html, summary_json, source_count, draft_path, status, created_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (subject, email_text, email_html, summary_json, source_count, draft_path, status, created_utc, target_recipients_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 summary["email_subject"],
@@ -467,6 +585,7 @@ def store_report(
                 str(draft_path),
                 "ready",
                 dt.datetime.now(dt.UTC).isoformat(),
+                json.dumps(recipients),
             ),
         )
         return int(cursor.lastrowid)
@@ -495,29 +614,66 @@ def get_report(db_path: Path, report_id: int) -> sqlite3.Row:
     return row
 
 
-def generate_report(config: Config) -> int:
+def generate_report(
+    config: Config,
+    companies: list[str] | None = None,
+    recipients: list[str] | None = None,
+    days_back: int | None = None,
+    time_window_label: str | None = None,
+) -> int:
     init_db(config.db_path)
     seed_recipients(config)
-    sources = collect_sources(config)
-    summary = build_summary(config, sources)
-    draft_path = write_draft(config, summary)
-    report_id = store_report(config, summary, draft_path, len(sources))
-    record_report(config, summary, draft_path, "draft")
+    target_companies = companies or config.companies
+    target_recipients = recipients or config.recipients
+    target_days_back = config.days_back if days_back is None else days_back
+    scoped_config = replace(
+        config,
+        companies=target_companies,
+        recipients=target_recipients,
+        days_back=target_days_back,
+    )
+    sources = collect_sources(scoped_config, companies=target_companies, days_back=target_days_back)
+    summary = build_summary(
+        scoped_config,
+        sources,
+        companies=target_companies,
+        time_window_label=time_window_label,
+    )
+    draft_path = write_draft(scoped_config, summary, recipients=target_recipients)
+    report_id = store_report(
+        config,
+        summary,
+        draft_path,
+        len(sources),
+        recipients=target_recipients,
+    )
+    record_report(config, summary, draft_path, "draft", recipients=target_recipients)
     return report_id
 
 
-def send_report(config: Config, report_id: int) -> list[str]:
+def send_report(
+    config: Config, report_id: int, recipients: list[str] | None = None
+) -> list[str]:
     init_db(config.db_path)
-    recipients = get_recipients(config.db_path)
-    if not recipients:
-        raise ValueError("Add at least one recipient before sending.")
-
     row = get_report(config.db_path, report_id)
     if row["sent_utc"]:
         raise ValueError("This report has already been sent.")
 
     summary = json.loads(row["summary_json"])
-    send_with_graph(config, summary, recipients=recipients)
+    target_recipients = recipients
+    if target_recipients is None:
+        stored_recipients = row["target_recipients_json"] if "target_recipients_json" in row.keys() else None
+        target_recipients = json.loads(stored_recipients) if stored_recipients else get_recipients(config.db_path)
+
+    if not target_recipients:
+        raise ValueError("Add at least one recipient before sending.")
+
+    if config.draft_only:
+        raise ValueError("Draft-only mode is enabled. MailerSend sending is disabled.")
+    if config.email_provider != "mailersend":
+        raise ValueError(f"Unsupported email_provider: {config.email_provider}")
+
+    send_with_mailersend(config, summary, recipients=target_recipients)
     sent_utc = dt.datetime.now(dt.UTC).isoformat()
     with sqlite3.connect(config.db_path) as conn:
         conn.execute(
@@ -526,16 +682,16 @@ def send_report(config: Config, report_id: int) -> list[str]:
             SET status = 'sent', sent_utc = ?, sent_recipients_json = ?
             WHERE id = ?
             """,
-            (sent_utc, json.dumps(recipients), report_id),
+            (sent_utc, json.dumps(target_recipients), report_id),
         )
         conn.execute(
             """
             INSERT INTO sent_reports (subject, recipients_json, draft_path, sent_utc, mode)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (row["subject"], json.dumps(recipients), row["draft_path"], sent_utc, "sent"),
+            (row["subject"], json.dumps(target_recipients), row["draft_path"], sent_utc, "sent"),
         )
-    return recipients
+    return target_recipients
 
 
 _generation_lock = threading.Lock()

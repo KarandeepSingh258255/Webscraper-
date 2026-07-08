@@ -13,10 +13,11 @@
   "max_results_per_company": 5,
   "draft_only": true,
   "require_human_approval": true,
-  "email_provider": "graph",
+  "email_provider": "mailersend",
   "db_path": "agent_state.sqlite3",
   "draft_dir": "drafts",
   "schedule_hour": 8,
   "schedule_minute": 0,
-  "timezone": "America/New_York"
+  "timezone": "America/New_York",
+  "sender_name": "Data Center Intelligence"
 }
